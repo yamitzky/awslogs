@@ -61,6 +61,7 @@ class AWSLogs(object):
             aws_session_token=self.aws_session_token,
             region_name=self.aws_region
         )
+        self.io = kwargs.get('io', sys.stdout)
 
     def _get_streams_from_pattern(self, group, pattern):
         """Returns streams in ``group`` matching ``pattern``."""
@@ -182,9 +183,9 @@ class AWSLogs(object):
                         message = json.dumps(message)
                 output.append(message.rstrip())
 
-                print(' '.join(output))
+                self.io.write(' '.join(output) + '\n')
                 try:
-                    sys.stdout.flush()
+                    self.io.flush()
                 except IOError as e:
                     if e.errno == errno.EPIPE:
                         # SIGPIPE received, so exit
@@ -195,18 +196,18 @@ class AWSLogs(object):
         try:
             consumer()
         except KeyboardInterrupt:
-            print('Closing...\n')
+            self.io.write('Closing...\n')
             os._exit(0)
 
     def list_groups(self):
         """Lists available CloudWatch logs groups"""
         for group in self.get_groups():
-            print(group)
+            self.io.write(group + '\n')
 
     def list_streams(self):
         """Lists available CloudWatch logs streams in ``log_group_name``."""
         for stream in self.get_streams():
-            print(stream)
+            self.io.write(stream + '\n')
 
     def get_groups(self):
         """Returns available CloudWatch logs groups"""
