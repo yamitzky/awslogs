@@ -71,7 +71,7 @@ class AWSLogs(object):
             if re.match(reg, stream):
                 yield stream
 
-    def list_logs(self):
+    def _list_streams(self):
         streams = []
         if self.log_stream_name != self.ALL_WILDCARD:
             streams = list(self._get_streams_from_pattern(self.log_group_name, self.log_stream_name))
@@ -84,66 +84,63 @@ class AWSLogs(object):
             if len(streams) == 0:
                 raise exceptions.NoStreamsFilteredError(self.log_stream_name)
 
+    def iter_logs(self, streams=None):
+        """Yield events into trying to deduplicate them using a lru queue.
+        AWS API stands for the interleaved parameter that:
+            interleaved (boolean) -- If provided, the API will make a best
+            effort to provide responses that contain events from multiple
+            log streams within the log group interleaved in a single
+            response. That makes some responses return some subsequent
+            response duplicate events. In a similar way when awslogs is
+            called with --watch option, we need to findout which events we
+            have alredy put in the queue in order to not do it several
+            times while waiting for new ones and reusing the same
+            next_token. The site of this queue is MAX_EVENTS_PER_CALL in
+            order to not exhaust the memory.
+        """
+        if not streams:
+            streams = self._list_streams()
+
+        interleaving_sanity = deque(maxlen=self.MAX_EVENTS_PER_CALL)
+        kwargs = {'logGroupName': self.log_group_name,
+                  'interleaved': True}
+
+        if streams:
+            kwargs['logStreamNames'] = streams
+
+        if self.start:
+            kwargs['startTime'] = self.start
+
+        if self.end:
+            kwargs['endTime'] = self.end
+
+        if self.filter_pattern:
+            kwargs['filterPattern'] = self.filter_pattern
+
+        while True:
+            response = self.client.filter_log_events(**kwargs)
+
+            for event in response.get('events', []):
+                if event['eventId'] not in interleaving_sanity:
+                    interleaving_sanity.append(event['eventId'])
+                    yield event
+
+            if 'nextToken' in response:
+                kwargs['nextToken'] = response['nextToken']
+            else:
+                if self.watch:
+                    time.sleep(1)
+                    continue
+                else:
+                    return
+
+    def list_logs(self, streams=None):
+        streams = self._list_streams()
         max_stream_length = max([len(s) for s in streams]) if streams else 10
         group_length = len(self.log_group_name)
 
-        # Note: filter_log_events paginator is broken
-        # ! Error during pagination: The same next token was received twice
-        do_wait = object()
-
-        def generator():
-            """Yield events into trying to deduplicate them using a lru queue.
-            AWS API stands for the interleaved parameter that:
-                interleaved (boolean) -- If provided, the API will make a best
-                effort to provide responses that contain events from multiple
-                log streams within the log group interleaved in a single
-                response. That makes some responses return some subsequent
-                response duplicate events. In a similar way when awslogs is
-                called with --watch option, we need to findout which events we
-                have alredy put in the queue in order to not do it several
-                times while waiting for new ones and reusing the same
-                next_token. The site of this queue is MAX_EVENTS_PER_CALL in
-                order to not exhaust the memory.
-            """
-            interleaving_sanity = deque(maxlen=self.MAX_EVENTS_PER_CALL)
-            kwargs = {'logGroupName': self.log_group_name,
-                      'interleaved': True}
-
-            if streams:
-                kwargs['logStreamNames'] = streams
-
-            if self.start:
-                kwargs['startTime'] = self.start
-
-            if self.end:
-                kwargs['endTime'] = self.end
-
-            if self.filter_pattern:
-                kwargs['filterPattern'] = self.filter_pattern
-
-            while True:
-                response = self.client.filter_log_events(**kwargs)
-
-                for event in response.get('events', []):
-                    if event['eventId'] not in interleaving_sanity:
-                        interleaving_sanity.append(event['eventId'])
-                        yield event
-
-                if 'nextToken' in response:
-                    kwargs['nextToken'] = response['nextToken']
-                else:
-                    yield do_wait
-
-        def consumer():
-            for event in generator():
-
-                if event is do_wait:
-                    if self.watch:
-                        time.sleep(1)
-                        continue
-                    else:
-                        return
-
+        try:
+            for event in self.iter_logs():
                 output = []
                 if self.output_group_enabled:
                     output.append(
@@ -193,8 +190,6 @@ class AWSLogs(object):
                     else:
                         # We don't want to handle any other errors from this
                         raise
-        try:
-            consumer()
         except KeyboardInterrupt:
             self.io.write('Closing...\n')
             os._exit(0)
